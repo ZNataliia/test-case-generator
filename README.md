@@ -17,6 +17,8 @@ test-case-generator/
   app.py              # Streamlit UI + logic
   prompts/
     template.md        # prompt template sent to Claude
+  tests/
+    test_app.py        # pytest suite (no API key/network needed)
   .env                # holds ANTHROPIC_API_KEY (gitignored)
   .gitignore
   requirements.txt
@@ -50,6 +52,14 @@ test-case-generator/
    ```
 
    Streamlit will open the app in your browser (usually `http://localhost:8501`).
+
+## Running tests
+
+```bash
+pytest
+```
+
+The suite doesn't call the real Anthropic API — it uses a fake stream object to test the cancellation logic and validates the JSON schema directly, so it runs fast and doesn't need an API key.
 
 ## Notes
 
