@@ -1,5 +1,7 @@
 streamlit
 anthropic>=0.116.0
 python-dotenv
+pandas
+httpx
 pytest
 jsonschema

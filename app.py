@@ -14,16 +14,6 @@ load_dotenv()
 MODEL = "claude-sonnet-5"
 PROMPT_TEMPLATE_PATH = Path(__file__).parent / "prompts" / "template.md"
 
-COLUMNS = [
-    "id",
-    "title",
-    "type",
-    "priority",
-    "preconditions",
-    "steps",
-    "expected_result",
-]
-
 TEST_CASE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -35,19 +25,19 @@ TEST_CASE_SCHEMA = {
                     "id": {"type": "string"},
                     "title": {"type": "string"},
                     "type": {"type": "string", "enum": ["Positive", "Negative", "Edge"]},
+                    "priority": {"type": "string", "enum": ["High", "Medium", "Low"]},
                     "preconditions": {"type": "string"},
                     "steps": {"type": "string"},
                     "expected_result": {"type": "string"},
-                    "priority": {"type": "string", "enum": ["High", "Medium", "Low"]},
                 },
                 "required": [
                     "id",
                     "title",
                     "type",
+                    "priority",
                     "preconditions",
                     "steps",
                     "expected_result",
-                    "priority",
                 ],
                 "additionalProperties": False,
             },
@@ -62,15 +52,43 @@ TEST_CASE_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Single source of truth for the table's column order -- derived from the
+# schema so it can never drift out of sync with what Claude is asked to return.
+COLUMNS = list(TEST_CASE_SCHEMA["properties"]["test_cases"]["items"]["properties"].keys())
+
+
+def _display_label(field_name: str) -> str:
+    if field_name == "id":
+        return "ID"
+    return field_name.replace("_", " ").title()
+
+
+def build_results_dataframe(test_cases: list[dict]) -> pd.DataFrame:
+    """Builds the results table. Raises KeyError if a test case is missing a required column."""
+    df = pd.DataFrame(test_cases)[COLUMNS]
+    df.columns = [_display_label(c) for c in df.columns]
+    return df
+
 
 def build_prompt(requirement: str, count: int) -> str:
     template = PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
-    return template.replace("{requirement}", requirement).replace("{count}", str(count))
+    # str.format() only scans the template's own {requirement}/{count}
+    # markers -- unlike chained .replace() calls, it never re-scans the
+    # substituted values themselves, so a requirement that happens to
+    # contain the literal text "{count}" or "{requirement}" is inserted
+    # verbatim instead of being partially rewritten.
+    return template.format(requirement=requirement, count=count)
 
 
 def _accumulate_stream(stream, cancel_event: threading.Event) -> tuple[str, bool]:
     """Reads text deltas from an open message stream, stopping early if
     cancel_event is set. Returns (accumulated_text, was_cancelled).
+
+    was_cancelled is only True if we actually stopped before the stream
+    finished. If the loop exhausts naturally, the full response has already
+    been generated (and billed) in its entirety, so it's returned as a
+    complete result even if cancel_event happened to be set right at the
+    end -- discarding it at that point wouldn't save a single token.
 
     Only touches stream.text_stream and the event, so it can be unit tested
     with a trivial fake stream instead of the real Anthropic SDK.
@@ -80,18 +98,27 @@ def _accumulate_stream(stream, cancel_event: threading.Event) -> tuple[str, bool
         if cancel_event.is_set():
             return "".join(text_parts), True
         text_parts.append(text)
-    return "".join(text_parts), cancel_event.is_set()
+    return "".join(text_parts), False
 
 
-def _set_error(result_box: dict, message: str) -> None:
-    # Don't overwrite a deliberate Stop with a late-arriving error caused by
-    # our own cancellation closing the connection.
-    if result_box.get("status") != "cancelled":
-        result_box["status"] = "error"
-        result_box["error_message"] = message
+def _set_error(result_box: dict, lock: threading.Lock, message: str) -> None:
+    # Locked so this can't race with the main thread's Stop handler (which
+    # writes "cancelled" under the same lock) -- without the lock, a
+    # check-then-act on result_box["status"] could let a deliberate Stop be
+    # silently overwritten by an error that arrives a moment later.
+    with lock:
+        if result_box.get("status") != "cancelled":
+            result_box["status"] = "error"
+            result_box["error_message"] = message
 
 
-def _run_generation(requirement: str, count: int, result_box: dict, cancel_event: threading.Event) -> None:
+def _run_generation(
+    requirement: str,
+    count: int,
+    result_box: dict,
+    cancel_event: threading.Event,
+    lock: threading.Lock,
+) -> None:
     """Runs in a background thread so the main script can keep rendering a Stop button.
 
     Uses the streaming API (not .create()) so that when Stop closes the
@@ -104,7 +131,7 @@ def _run_generation(requirement: str, count: int, result_box: dict, cancel_event
     try:
         client = anthropic.Anthropic()
         prompt = build_prompt(requirement, count)
-        max_tokens = min(8192, max(2000, count * 500))
+        max_tokens = min(16000, max(2000, count * 1200))
 
         with client.messages.stream(
             model=MODEL,
@@ -113,29 +140,46 @@ def _run_generation(requirement: str, count: int, result_box: dict, cancel_event
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
             text, cancelled = _accumulate_stream(stream, cancel_event)
+            final_message = None
+            if not cancelled:
+                # Safe to call now: the stream is already fully drained by
+                # _accumulate_stream, so this returns immediately instead of
+                # blocking to read more (it would otherwise defeat
+                # cancellation by draining the rest of the response).
+                final_message = stream.get_final_message()
 
         if cancelled:
             return  # main thread already set status to "cancelled"
 
+        if final_message is not None and final_message.stop_reason == "max_tokens":
+            _set_error(
+                result_box,
+                lock,
+                f"Claude's response was cut off after hitting the {max_tokens}-token limit "
+                f"before finishing all {count} test cases. Try a smaller count, or a shorter requirement.",
+            )
+            return
+
         data = json.loads(text)
-        if result_box.get("status") != "cancelled":
-            result_box["status"] = "done"
-            result_box["result"] = data
+        with lock:
+            if result_box.get("status") != "cancelled":
+                result_box["status"] = "done"
+                result_box["result"] = data
     except anthropic.AuthenticationError:
-        _set_error(result_box, "Authentication failed. Check that your ANTHROPIC_API_KEY in `.env` is valid.")
+        _set_error(result_box, lock, "Authentication failed. Check that your ANTHROPIC_API_KEY in `.env` is valid.")
     except anthropic.RateLimitError:
-        _set_error(result_box, "Rate limited by the Anthropic API. Wait a moment and try again.")
+        _set_error(result_box, lock, "Rate limited by the Anthropic API. Wait a moment and try again.")
     except anthropic.APIStatusError as e:
-        _set_error(result_box, f"Anthropic API error ({e.status_code}): {e.message}")
+        _set_error(result_box, lock, f"Anthropic API error ({e.status_code}): {e.message}")
     except anthropic.APIConnectionError:
         # A connection drop while streaming (including one caused by our own
         # cancellation closing it) can also raise this -- the cancelled-status
-        # guard above/in _set_error keeps it from clobbering a deliberate Stop.
-        _set_error(result_box, "Could not connect to the Anthropic API. Check your internet connection.")
+        # guard inside _set_error keeps it from clobbering a deliberate Stop.
+        _set_error(result_box, lock, "Could not connect to the Anthropic API. Check your internet connection.")
     except (json.JSONDecodeError, StopIteration):
-        _set_error(result_box, "Claude's response could not be parsed as JSON. Try generating again.")
+        _set_error(result_box, lock, "Claude's response could not be parsed as JSON. Try generating again.")
     except Exception as e:  # noqa: BLE001 - surface anything unexpected instead of hanging silently
-        _set_error(result_box, f"Unexpected error: {e}")
+        _set_error(result_box, lock, f"Unexpected error: {e}")
 
 
 if __name__ == "__main__":
@@ -179,26 +223,33 @@ if __name__ == "__main__":
             "Stop",
             disabled=not is_running,
             help=(
-                "Stops sending you further tokens. Checked between streamed chunks, so it "
-                "typically takes effect within a second or two -- not instantly -- and any "
-                "tokens already generated up to that point are still billed."
+                "Stops sending you further tokens once the next chunk arrives -- if Claude "
+                "hasn't started responding yet, Stop won't take effect until it does. Any "
+                "tokens already generated by then are still billed."
             ),
         )
 
     if generate_clicked:
         cancel_event = threading.Event()
+        lock = threading.Lock()
         result_box = {"status": "running", "result": None, "error_message": None}
         st.session_state.cancel_event = cancel_event
+        st.session_state.status_lock = lock
         st.session_state.gen_state = result_box
         thread = threading.Thread(
             target=_run_generation,
-            args=(requirement, num_test_cases, result_box, cancel_event),
+            args=(requirement, num_test_cases, result_box, cancel_event, lock),
             daemon=True,
         )
         thread.start()
 
     if stop_clicked:
-        st.session_state.gen_state["status"] = "cancelled"
+        lock = st.session_state.get("status_lock")
+        if lock is not None:
+            with lock:
+                st.session_state.gen_state["status"] = "cancelled"
+        else:
+            st.session_state.gen_state["status"] = "cancelled"
         cancel_event = st.session_state.get("cancel_event")
         if cancel_event is not None:
             cancel_event.set()
@@ -223,26 +274,19 @@ if __name__ == "__main__":
 
         test_cases = result.get("test_cases") or []
         if test_cases:
-            df = pd.DataFrame(test_cases)[COLUMNS]
-            df = df.rename(
-                columns={
-                    "id": "ID",
-                    "title": "Title",
-                    "type": "Type",
-                    "priority": "Priority",
-                    "preconditions": "Preconditions",
-                    "steps": "Steps",
-                    "expected_result": "Expected Result",
-                }
-            )
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            try:
+                df = build_results_dataframe(test_cases)
+            except KeyError as e:
+                st.error(f"Claude's response was missing an expected field ({e}). Try generating again.")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
 
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download as CSV",
-                data=csv_bytes,
-                file_name="test_cases.csv",
-                mime="text/csv",
-            )
+                csv_bytes = df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download as CSV",
+                    data=csv_bytes,
+                    file_name="test_cases.csv",
+                    mime="text/csv",
+                )
         else:
             st.info("No test cases were generated.")
