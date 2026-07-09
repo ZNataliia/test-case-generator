@@ -1,0 +1,5 @@
+streamlit
+anthropic>=0.116.0
+python-dotenv
+pytest
+jsonschema
