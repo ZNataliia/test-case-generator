@@ -229,6 +229,16 @@ if __name__ == "__main__":
             ),
         )
 
+    # A single stable placeholder for the whole status/results region below.
+    # Rendering into it (instead of calling st.warning/st.error/st.dataframe
+    # directly at the top level) forces Streamlit to atomically replace its
+    # entire contents each rerun -- with plain top-level calls, a message
+    # rendered on one run (e.g. the "cancelled" warning) could still be
+    # showing on screen moments into the *next* run, since disabled/enabled
+    # button state updates independently of when this region's own delta
+    # is flushed to the browser during the sleep()-based polling loop.
+    status_placeholder = st.empty()
+
     if generate_clicked:
         cancel_event = threading.Event()
         lock = threading.Lock()
@@ -256,37 +266,38 @@ if __name__ == "__main__":
 
     state = st.session_state.gen_state
 
-    if state["status"] == "running":
-        with st.spinner("Streaming test cases... click Stop to cancel."):
-            time.sleep(0.5)
-        st.rerun()
-    elif state["status"] == "cancelled":
-        st.warning("Generation stopped. Tokens generated before Stop was clicked may still have been billed.")
-    elif state["status"] == "error":
-        st.error(state["error_message"])
-    elif state["status"] == "done":
-        result = state["result"]
-        ambiguities = result.get("ambiguities") or []
-        if ambiguities:
-            with st.expander(f"⚠️ {len(ambiguities)} ambiguity(ies) flagged in the requirement", expanded=True):
-                for item in ambiguities:
-                    st.markdown(f"- {item}")
+    with status_placeholder.container():
+        if state["status"] == "running":
+            with st.spinner("Streaming test cases... click Stop to cancel."):
+                time.sleep(0.5)
+            st.rerun()
+        elif state["status"] == "cancelled":
+            st.warning("Generation stopped. Tokens generated before Stop was clicked may still have been billed.")
+        elif state["status"] == "error":
+            st.error(state["error_message"])
+        elif state["status"] == "done":
+            result = state["result"]
+            ambiguities = result.get("ambiguities") or []
+            if ambiguities:
+                with st.expander(f"⚠️ {len(ambiguities)} ambiguity(ies) flagged in the requirement", expanded=True):
+                    for item in ambiguities:
+                        st.markdown(f"- {item}")
 
-        test_cases = result.get("test_cases") or []
-        if test_cases:
-            try:
-                df = build_results_dataframe(test_cases)
-            except KeyError as e:
-                st.error(f"Claude's response was missing an expected field ({e}). Try generating again.")
+            test_cases = result.get("test_cases") or []
+            if test_cases:
+                try:
+                    df = build_results_dataframe(test_cases)
+                except KeyError as e:
+                    st.error(f"Claude's response was missing an expected field ({e}). Try generating again.")
+                else:
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+
+                    csv_bytes = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "Download as CSV",
+                        data=csv_bytes,
+                        file_name="test_cases.csv",
+                        mime="text/csv",
+                    )
             else:
-                st.dataframe(df, use_container_width=True, hide_index=True)
-
-                csv_bytes = df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download as CSV",
-                    data=csv_bytes,
-                    file_name="test_cases.csv",
-                    mime="text/csv",
-                )
-        else:
-            st.info("No test cases were generated.")
+                st.info("No test cases were generated.")
